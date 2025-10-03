@@ -1,0 +1,56 @@
+# Core LLM & Orchestration
+langchain==0.3.25
+langchain-core==0.3.65
+langchain-google-genai==2.0.11
+langchain-huggingface==0.1.2
+langchain-community==0.3.25
+langchain-text-splitters==0.3.8
+langchain-chroma==0.1.4
+langgraph==0.2.73
+
+# Vector Databases
+chromadb==0.5.20
+
+# Embeddings & Re-ranking
+sentence-transformers==2.7.0
+cohere==5.11.4
+
+# PDF Processing
+pymupdf==1.24.13
+pypdf==5.1.0
+
+# Web Scraping
+beautifulsoup4==4.12.3
+httpx==0.27.2
+
+# BM25 Keyword Search
+rank-bm25==0.2.2
+nltk==3.9.1
+
+# Database
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+
+# API Backend
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+pydantic==2.10.2
+pydantic-settings==2.6.1
+
+# Evaluation
+ragas==0.2.6
+datasets==3.1.0
+
+# Utilities
+aiofiles==24.1.0
+python-dotenv==1.0.1
+tenacity==9.0.0
+tiktoken==0.8.0
+pandas==2.2.3
+tqdm==4.67.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.27.2
