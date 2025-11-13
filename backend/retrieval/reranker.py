@@ -1,14 +1,12 @@
 """
 backend/retrieval/reranker.py
 
-Cohere re-ranking: takes hybrid search candidates and re-scores them
-using a cross-encoder model (much more accurate than bi-encoder retrieval).
+Two-tier re-ranking strategy:
+  1. CohereReranker  — cloud cross-encoder, best quality, needs API key
+  2. LocalCrossEncoderReranker — local ms-marco model, no API key required
+  3. Fallback        — RRF score order (if both unavailable)
 
-Why re-rank?
-  - Retrieval (bi-encoder) = fast but coarse
-  - Re-ranking (cross-encoder) = slow but precise
-  - We run retrieval on 20-40 candidates, re-rank, keep top 6
-  - This pattern is used by production RAG systems at Notion, Perplexity, etc.
+Priority: Cohere > Local > Fallback
 """
 from __future__ import annotations
 from typing import Any
@@ -24,7 +22,6 @@ logger = get_logger("reranker")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=20), reraise=True)
 def _cohere_rerank(client: Any, model: str, query: str, documents: list[str], top_n: int):
-    """Isolated Cohere API call so tenacity only retries the network hop."""
     return client.rerank(
         model=model,
         query=query,
@@ -34,15 +31,65 @@ def _cohere_rerank(client: Any, model: str, query: str, documents: list[str], to
     )
 
 
+class LocalCrossEncoderReranker:
+    """
+    Local cross-encoder re-ranker using sentence-transformers.
+    No API key needed — model downloads on first use (~22 MB).
+    Uses ms-marco-MiniLM-L-6-v2 which scores query-document relevance
+    on the same scale as Cohere (higher = more relevant).
+    """
+
+    _model = None  # class-level lazy singleton
+
+    def _get_model(self):
+        if LocalCrossEncoderReranker._model is None:
+            from sentence_transformers import CrossEncoder
+            logger.info("Loading local cross-encoder (ms-marco-MiniLM-L-6-v2)...")
+            LocalCrossEncoderReranker._model = CrossEncoder(
+                "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            )
+            logger.info("Local cross-encoder ready")
+        return LocalCrossEncoderReranker._model
+
+    def rerank(
+        self,
+        query: str,
+        docs: list[Document],
+        top_n: int,
+    ) -> list[Document]:
+        if not docs:
+            return []
+
+        model = self._get_model()
+        pairs = [(query, doc.page_content) for doc in docs]
+        raw_scores = model.predict(pairs)
+
+        ranked = sorted(
+            zip(docs, raw_scores.tolist()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        result = []
+        for doc, score in ranked[:top_n]:
+            doc.metadata["relevance_score"] = round(float(score), 4)
+            doc.metadata["reranked"] = True
+            doc.metadata["reranker"] = "local-cross-encoder"
+            result.append(doc)
+
+        return result
+
+
 class CohereReranker:
     """
     Re-ranks documents using Cohere's rerank API.
-    Falls back to RRF-score ordering if Cohere key not configured.
+    Falls back to LocalCrossEncoderReranker if Cohere key not configured.
     """
 
     def __init__(self):
         self._settings = get_settings()
         self._client = None
+        self._local: LocalCrossEncoderReranker | None = None
         self._init_client()
 
     def _init_client(self) -> None:
@@ -52,7 +99,10 @@ class CohereReranker:
                 self._client = cohere.Client(self._settings.cohere_api_key)
                 logger.info("Cohere reranker initialised")
             except ImportError:
-                logger.warning("cohere package not installed — using fallback ordering")
+                logger.warning("cohere package not installed — trying local fallback")
+        else:
+            logger.info("No COHERE_API_KEY — using local cross-encoder fallback")
+            self._local = LocalCrossEncoderReranker()
 
     def rerank(
         self,
@@ -66,36 +116,40 @@ class CohereReranker:
         if not docs:
             return []
 
-        if self._client is None:
-            for doc in docs[:top_n]:
-                doc.metadata.setdefault("relevance_score", 0.5)
-                doc.metadata["reranked"] = False
-            return docs[:top_n]
+        # Tier 1: Cohere cloud
+        if self._client is not None:
+            try:
+                response = _cohere_rerank(
+                    self._client,
+                    self._settings.cohere_rerank_model,
+                    query,
+                    [doc.page_content for doc in docs],
+                    top_n,
+                )
+                reranked = []
+                for result in response.results:
+                    doc = docs[result.index]
+                    doc.metadata["relevance_score"] = round(result.relevance_score, 4)
+                    doc.metadata["reranked"] = True
+                    doc.metadata["reranker"] = "cohere"
+                    reranked.append(doc)
+                return reranked
+            except Exception as e:
+                logger.warning(f"Cohere rerank failed ({e}). Falling back to local.")
 
+        # Tier 2: Local cross-encoder
+        if self._local is None:
+            self._local = LocalCrossEncoderReranker()
         try:
-            response = _cohere_rerank(
-                self._client,
-                self._settings.cohere_rerank_model,
-                query,
-                [doc.page_content for doc in docs],
-                top_n,
-            )
-
-            reranked = []
-            for result in response.results:
-                doc = docs[result.index]
-                doc.metadata["relevance_score"] = round(result.relevance_score, 4)
-                doc.metadata["reranked"] = True
-                reranked.append(doc)
-
-            return reranked
-
+            return self._local.rerank(query, docs, top_n)
         except Exception as e:
-            logger.warning(f"Cohere rerank failed after retries ({e}). Using fallback.")
-            for doc in docs[:top_n]:
-                doc.metadata.setdefault("relevance_score", 0.5)
-                doc.metadata["reranked"] = False
-            return docs[:top_n]
+            logger.warning(f"Local reranker failed ({e}). Using RRF order.")
+
+        # Tier 3: RRF order
+        for doc in docs[:top_n]:
+            doc.metadata.setdefault("relevance_score", 0.5)
+            doc.metadata["reranked"] = False
+        return docs[:top_n]
 
 
 _reranker_instance: CohereReranker | None = None
