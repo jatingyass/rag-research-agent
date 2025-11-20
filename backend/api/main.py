@@ -8,9 +8,10 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.security import APIKeyHeader
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .routes.ingest import router as ingest_router
@@ -21,6 +22,15 @@ from ..core.config import get_settings
 from ..core.logging import get_logger
 
 logger = get_logger("api")
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def _verify_api_key(key: str | None = Security(_api_key_header)) -> None:
+    """Dependency: reject requests when API_KEY is configured and header doesn't match."""
+    settings = get_settings()
+    if settings.api_key and key != settings.api_key:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-API-Key header")
 
 
 class _RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -51,6 +61,10 @@ async def lifespan(app: FastAPI):
         logger.warning("GEMINI_API_KEY not set — queries will fail. Add it to .env")
     else:
         logger.info("Gemini API key: found")
+    if settings.api_key:
+        logger.info("API key authentication: enabled")
+    else:
+        logger.info("API key authentication: disabled (set API_KEY in .env to enable)")
     logger.info("Ready. Embeddings load on first request.")
     yield
     logger.info("Shutting down.")
@@ -81,10 +95,11 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-    app.include_router(ingest_router)
-    app.include_router(query_router)
-    app.include_router(eval_router)
-    app.include_router(sessions_router)
+    # All /api/* routes require API key when configured
+    app.include_router(ingest_router, dependencies=[Depends(_verify_api_key)])
+    app.include_router(query_router, dependencies=[Depends(_verify_api_key)])
+    app.include_router(eval_router, dependencies=[Depends(_verify_api_key)])
+    app.include_router(sessions_router, dependencies=[Depends(_verify_api_key)])
 
     @app.get("/health")
     async def health():
@@ -98,6 +113,7 @@ def create_app() -> FastAPI:
             "status": "ok",
             "vector_db": settings.vector_db,
             "num_sources": num_sources,
+            "auth_enabled": bool(settings.api_key),
             "version": "1.0.0",
         }
 
