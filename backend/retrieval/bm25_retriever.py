@@ -14,23 +14,27 @@ from ..ingestion.chunker import Chunk
 
 def _ensure_nltk_data() -> None:
     import nltk
-    for resource in ("punkt_tab", "punkt"):
+    for resource, pkg in (
+        ("tokenizers/punkt_tab", "punkt_tab"),
+        ("corpora/stopwords", "stopwords"),
+    ):
         try:
-            nltk.data.find(f"tokenizers/{resource}")
-            return
+            nltk.data.find(resource)
         except LookupError:
-            pass
-    nltk.download("punkt_tab", quiet=True)
+            nltk.download(pkg, quiet=True)
 
 
 def _tokenize(text: str) -> list[str]:
-    try:
-        from nltk.tokenize import word_tokenize
-        return [w.lower() for w in word_tokenize(text) if w.isalpha()]
-    except LookupError:
-        _ensure_nltk_data()
-        from nltk.tokenize import word_tokenize
-        return [w.lower() for w in word_tokenize(text) if w.isalpha()]
+    _ensure_nltk_data()
+    from nltk.tokenize import word_tokenize
+    from nltk.corpus import stopwords as _sw
+
+    stop_words = _sw.words("english")
+    tokens = word_tokenize(text)
+    return [
+        w.lower() for w in tokens
+        if w.isalpha() and w.lower() not in stop_words
+    ]
 
 
 class BM25Retriever:
