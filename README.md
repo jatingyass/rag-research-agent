@@ -1,14 +1,3 @@
----
-title: RAG Research Agent
-emoji: 🔬
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
-short_description: AI research agent with hybrid search and citations
----
 
 # Multi-Source RAG Research Agent
 
