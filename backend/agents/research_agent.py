@@ -2,23 +2,26 @@
 backend/agents/research_agent.py
 
 LangGraph-based research agent with:
-  - Hybrid retrieval (semantic + BM25)
-  - Cohere re-ranking
+  - Query routing: classify as direct-answer vs retrieval-needed
+  - Hybrid retrieval (semantic + BM25 + RRF fusion)
+  - Cohere / local cross-encoder re-ranking
   - Citation-tracked answer generation
-  - Query contextualization (handles follow-up questions)
+  - Query contextualization for follow-up questions
   - Streaming support
 """
 from __future__ import annotations
 import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal, TypedDict
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import END, StateGraph
 
 from ..core.llm import get_llm, get_streaming_llm
+from ..core.logging import get_logger
 from ..retrieval.vector_store import get_vector_store
 from ..retrieval.bm25_retriever import get_bm25_retriever
 from ..retrieval.hybrid import HybridRetriever
@@ -26,6 +29,10 @@ from ..retrieval.reranker import get_reranker
 from ..core.config import get_settings
 from .prompts import RESEARCH_SYSTEM_PROMPT, QUERY_CONTEXTUALIZATION_PROMPT
 
+logger = get_logger("research_agent")
+
+
+# ── Data models ──────────────────────────────────────────────────────────────
 
 @dataclass
 class Citation:
@@ -35,7 +42,7 @@ class Citation:
     url: str | None
     chunk_id: str
     relevance_score: float
-    retrieval_source: str  # "semantic" | "bm25" | "both"
+    retrieval_source: str
 
     def to_dict(self) -> dict:
         return {
@@ -53,9 +60,10 @@ class Citation:
 class ResearchResult:
     answer: str
     citations: list[Citation]
-    context_chunks: list[str]  # Raw chunks used
+    context_chunks: list[str]
     query: str
-    contextualized_query: str  # After query expansion
+    contextualized_query: str
+    route: str = "retrieve"
 
     def to_dict(self) -> dict:
         return {
@@ -64,11 +72,27 @@ class ResearchResult:
             "query": self.query,
             "contextualized_query": self.contextualized_query,
             "num_chunks_retrieved": len(self.context_chunks),
+            "route": self.route,
         }
 
 
+# ── LangGraph state ───────────────────────────────────────────────────────────
+
+class AgentState(TypedDict):
+    query: str
+    contextualized_query: str
+    chat_history: list[dict]
+    filters: dict[str, str] | None
+    hybrid_results: list          # list[tuple[Document, float]]
+    reranked_docs: list           # list[Document]
+    answer: str
+    citations: list               # list[Citation]
+    route: str                    # "direct" | "retrieve"
+
+
+# ── Helper functions ──────────────────────────────────────────────────────────
+
 def _docs_to_citations(docs: list[Document]) -> list[Citation]:
-    """Extract Citation objects from retrieved documents."""
     citations = []
     for doc in docs:
         m = doc.metadata
@@ -85,7 +109,6 @@ def _docs_to_citations(docs: list[Document]) -> list[Citation]:
 
 
 def _format_context(docs: list[Document]) -> str:
-    """Format retrieved documents into a structured context block for the LLM."""
     parts = []
     for i, doc in enumerate(docs, start=1):
         m = doc.metadata
@@ -93,20 +116,116 @@ def _format_context(docs: list[Document]) -> str:
         page = f", Page {m['page_number']}" if m.get("page_number") else ""
         url = f"\nURL: {m['url']}" if m.get("url") else ""
         score = m.get("relevance_score", m.get("rrf_score", 0))
-
         header = f"[Document {i}] Source: {source}{page}{url} (relevance: {score:.3f})"
         parts.append(f"{header}\n{doc.page_content}")
-
     return "\n\n---\n\n".join(parts)
 
 
+_ROUTE_PROMPT = ChatPromptTemplate.from_template(
+    """Classify the following user query into exactly one category:
+
+- "direct": The query is a greeting, a meta-question about the system (e.g.
+  "what can you do?"), or something answerable from general knowledge without
+  needing to search the knowledge base.
+- "retrieve": The query requires looking up specific facts, documents, or
+  data from the ingested knowledge base.
+
+Query: {query}
+
+Reply with only the single word: direct  OR  retrieve"""
+)
+
+_NO_DOCS_ANSWER = (
+    "I couldn't find any relevant information in the knowledge base to answer "
+    "your question. Please ensure relevant documents have been ingested, or "
+    "try rephrasing your question."
+)
+
+
+# ── Node functions ────────────────────────────────────────────────────────────
+
+def _node_contextualize(state: AgentState, llm, settings) -> AgentState:
+    query = state["query"]
+    chat_history = state.get("chat_history") or []
+    if not chat_history:
+        return {**state, "contextualized_query": query}
+
+    history_str = "\n".join([
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in chat_history[-6:]
+    ])
+    prompt = ChatPromptTemplate.from_template(QUERY_CONTEXTUALIZATION_PROMPT)
+    chain = prompt | llm | StrOutputParser()
+    try:
+        contextualized = chain.invoke({"chat_history": history_str, "question": query})
+    except Exception:
+        contextualized = query
+    return {**state, "contextualized_query": contextualized}
+
+
+def _node_route_query(state: AgentState, llm) -> AgentState:
+    chain = _ROUTE_PROMPT | llm | StrOutputParser()
+    try:
+        route_raw = chain.invoke({"query": state["contextualized_query"]}).strip().lower()
+        route: Literal["direct", "retrieve"] = "direct" if route_raw == "direct" else "retrieve"
+    except Exception:
+        route = "retrieve"
+    logger.info(f"Query route: {route}")
+    return {**state, "route": route}
+
+
+def _node_retrieve(state: AgentState, hybrid: HybridRetriever, reranker, settings) -> AgentState:
+    hybrid_results = hybrid.retrieve(
+        query=state["contextualized_query"],
+        k_semantic=settings.top_k_semantic,
+        k_bm25=settings.top_k_bm25,
+        filters=state.get("filters"),
+    )
+    reranked_docs = reranker.rerank(
+        query=state["contextualized_query"],
+        documents=hybrid_results,
+        top_n=settings.top_k_final,
+    )
+    return {**state, "hybrid_results": hybrid_results, "reranked_docs": reranked_docs}
+
+
+def _node_generate(state: AgentState, llm) -> AgentState:
+    docs = state.get("reranked_docs") or []
+    if not docs:
+        return {**state, "answer": _NO_DOCS_ANSWER, "citations": []}
+
+    context = _format_context(docs)
+    citations = _docs_to_citations(docs)
+    messages = [
+        SystemMessage(content=RESEARCH_SYSTEM_PROMPT),
+        HumanMessage(content=(
+            f"Context Documents:\n\n{context}\n\n"
+            f"---\n\nResearch Question: {state['query']}"
+        )),
+    ]
+    response = llm.invoke(messages)
+    return {**state, "answer": response.content, "citations": citations}
+
+
+def _node_direct_answer(state: AgentState, llm) -> AgentState:
+    messages = [
+        SystemMessage(content=(
+            "You are a helpful research assistant. Answer the user's question "
+            "conversationally. If it's a greeting, respond warmly. "
+            "If they ask what you can do, explain you help research documents."
+        )),
+        HumanMessage(content=state["query"]),
+    ]
+    response = llm.invoke(messages)
+    return {**state, "answer": response.content, "citations": []}
+
+
+# ── Agent class ───────────────────────────────────────────────────────────────
+
 class ResearchAgent:
     """
-    Full research RAG pipeline:
-    1. Contextualize query (handle follow-ups)
-    2. Hybrid retrieve (semantic + BM25 + RRF fusion)
-    3. Re-rank with Cohere
-    4. Generate cited answer with GPT-4o
+    LangGraph-based research agent.
+    Graph: contextualize → route_query → [retrieve → generate | direct_answer]
     """
 
     def __init__(self, user_id: str):
@@ -117,34 +236,34 @@ class ResearchAgent:
         self._bm25 = get_bm25_retriever(user_id)
         self._hybrid = HybridRetriever(self._vector_store, self._bm25)
         self._reranker = get_reranker()
-        self._contextualize_prompt = ChatPromptTemplate.from_template(
-            QUERY_CONTEXTUALIZATION_PROMPT
+        self._graph = self._build_graph()
+
+    def _build_graph(self):
+        llm = self._llm
+        hybrid = self._hybrid
+        reranker = self._reranker
+        settings = self._settings
+
+        graph = StateGraph(AgentState)
+
+        graph.add_node("contextualize", lambda s: _node_contextualize(s, llm, settings))
+        graph.add_node("route_query", lambda s: _node_route_query(s, llm))
+        graph.add_node("retrieve", lambda s: _node_retrieve(s, hybrid, reranker, settings))
+        graph.add_node("generate", lambda s: _node_generate(s, llm))
+        graph.add_node("direct_answer", lambda s: _node_direct_answer(s, llm))
+
+        graph.set_entry_point("contextualize")
+        graph.add_edge("contextualize", "route_query")
+        graph.add_conditional_edges(
+            "route_query",
+            lambda s: s["route"],
+            {"retrieve": "retrieve", "direct": "direct_answer"},
         )
-        self._contextualize_chain = (
-            self._contextualize_prompt | self._llm | StrOutputParser()
-        )
+        graph.add_edge("retrieve", "generate")
+        graph.add_edge("generate", END)
+        graph.add_edge("direct_answer", END)
 
-    def _contextualize_query(
-        self,
-        query: str,
-        chat_history: list[dict] | None = None,
-    ) -> str:
-        """Rewrite follow-up questions to standalone questions."""
-        if not chat_history:
-            return query
-
-        history_str = "\n".join([
-            f"{msg['role'].capitalize()}: {msg['content']}"
-            for msg in chat_history[-6:]  # Last 3 turns
-        ])
-
-        try:
-            return self._contextualize_chain.invoke({
-                "chat_history": history_str,
-                "question": query,
-            })
-        except Exception:
-            return query  # Fallback to original query
+        return graph.compile()
 
     def query(
         self,
@@ -152,62 +271,25 @@ class ResearchAgent:
         chat_history: list[dict] | None = None,
         filters: dict[str, str] | None = None,
     ) -> ResearchResult:
-        """
-        Full synchronous query pipeline.
-        Returns structured result with answer + citations.
-        """
-        # Step 1: Contextualize
-        contextualized = self._contextualize_query(query, chat_history)
-
-        # Step 2: Hybrid retrieve
-        hybrid_results = self._hybrid.retrieve(
-            query=contextualized,
-            k_semantic=self._settings.top_k_semantic,
-            k_bm25=self._settings.top_k_bm25,
-            filters=filters,
-        )
-
-        # Step 3: Re-rank
-        reranked_docs = self._reranker.rerank(
-            query=contextualized,
-            documents=hybrid_results,
-            top_n=self._settings.top_k_final,
-        )
-
-        if not reranked_docs:
-            return ResearchResult(
-                answer=(
-                    "I couldn't find any relevant information in the knowledge base "
-                    "to answer your question. Please ensure relevant documents have "
-                    "been ingested, or try rephrasing your question."
-                ),
-                citations=[],
-                context_chunks=[],
-                query=query,
-                contextualized_query=contextualized,
-            )
-
-        # Step 4: Format context and generate answer with Gemini
-        context = _format_context(reranked_docs)
-        citations = _docs_to_citations(reranked_docs)
-
-        messages = [
-            SystemMessage(content=RESEARCH_SYSTEM_PROMPT),
-            HumanMessage(content=(
-                f"Context Documents:\n\n{context}\n\n"
-                f"---\n\nResearch Question: {query}"
-            )),
-        ]
-
-        response = self._llm.invoke(messages)
-        answer = response.content
-
+        initial: AgentState = {
+            "query": query,
+            "contextualized_query": query,
+            "chat_history": chat_history or [],
+            "filters": filters,
+            "hybrid_results": [],
+            "reranked_docs": [],
+            "answer": "",
+            "citations": [],
+            "route": "retrieve",
+        }
+        final = self._graph.invoke(initial)
         return ResearchResult(
-            answer=answer,
-            citations=citations,
-            context_chunks=[doc.page_content for doc in reranked_docs],
+            answer=final["answer"],
+            citations=final["citations"],
+            context_chunks=[d.page_content for d in final.get("reranked_docs", [])],
             query=query,
-            contextualized_query=contextualized,
+            contextualized_query=final["contextualized_query"],
+            route=final["route"],
         )
 
     async def stream_query(
@@ -216,27 +298,48 @@ class ResearchAgent:
         chat_history: list[dict] | None = None,
         filters: dict[str, str] | None = None,
     ) -> AsyncIterator[str]:
-        """
-        Streaming version — yields answer tokens as they arrive.
-        Yields special JSON markers for citations at the end.
-        """
         streaming_llm = get_streaming_llm()
 
-        # Steps 1–3 same as above
-        contextualized = self._contextualize_query(query, chat_history)
-        hybrid_results = self._hybrid.retrieve(query=contextualized, filters=filters)
-        reranked_docs = self._reranker.rerank(
-            query=contextualized,
-            documents=hybrid_results,
-        )
+        # Run the graph synchronously for retrieval steps, then stream generation
+        initial: AgentState = {
+            "query": query,
+            "contextualized_query": query,
+            "chat_history": chat_history or [],
+            "filters": filters,
+            "hybrid_results": [],
+            "reranked_docs": [],
+            "answer": "",
+            "citations": [],
+            "route": "retrieve",
+        }
 
-        if not reranked_docs:
-            yield "I couldn't find relevant information. Please ingest documents first."
+        # Contextualize and route
+        state = _node_contextualize(initial, self._llm, self._settings)
+        state = _node_route_query(state, self._llm)
+
+        if state["route"] == "direct":
+            messages = [
+                SystemMessage(content=(
+                    "You are a helpful research assistant. Answer conversationally."
+                )),
+                HumanMessage(content=query),
+            ]
+            async for chunk in streaming_llm.astream(messages):
+                if chunk.content:
+                    yield chunk.content
+            yield f"\n\n__CITATIONS_JSON__{json.dumps({'__citations__': [], '__contextualized_query__': state['contextualized_query']})}"
             return
 
-        context = _format_context(reranked_docs)
-        citations = _docs_to_citations(reranked_docs)
+        # Retrieve
+        state = _node_retrieve(state, self._hybrid, self._reranker, self._settings)
+        docs = state.get("reranked_docs") or []
 
+        if not docs:
+            yield _NO_DOCS_ANSWER
+            return
+
+        context = _format_context(docs)
+        citations = _docs_to_citations(docs)
         messages = [
             SystemMessage(content=RESEARCH_SYSTEM_PROMPT),
             HumanMessage(content=(
@@ -245,15 +348,13 @@ class ResearchAgent:
             )),
         ]
 
-        # Stream answer tokens
         async for chunk in streaming_llm.astream(messages):
             if chunk.content:
                 yield chunk.content
 
-        # Send citations as a final structured marker
         citations_payload = {
             "__citations__": [c.to_dict() for c in citations],
-            "__contextualized_query__": contextualized,
+            "__contextualized_query__": state["contextualized_query"],
         }
         yield f"\n\n__CITATIONS_JSON__{json.dumps(citations_payload)}"
 
@@ -261,8 +362,7 @@ class ResearchAgent:
 _agent_instances: dict[str, ResearchAgent] = {}
 
 
-def get_research_agent(user_id: str) -> ResearchAgent:
-    """Per-user research agent, lazily created and cached."""
+def get_research_agent(user_id: str = "default") -> ResearchAgent:
     if user_id not in _agent_instances:
         _agent_instances[user_id] = ResearchAgent(user_id)
     return _agent_instances[user_id]
