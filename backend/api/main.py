@@ -103,17 +103,24 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
+        import platform
         from ..retrieval.vector_store import get_vector_store
         try:
             vs = get_vector_store()
             num_sources = len(vs.get_source_ids())
+            vector_db_ok = True
         except Exception:
             num_sources = 0
+            vector_db_ok = False
         return {
             "status": "ok",
             "vector_db": settings.vector_db,
+            "vector_db_ok": vector_db_ok,
             "num_sources": num_sources,
+            "llm_model": settings.gemini_model,
+            "llm_timeout_s": settings.llm_request_timeout,
             "auth_enabled": bool(settings.api_key),
+            "python": platform.python_version(),
             "version": "1.0.0",
         }
 

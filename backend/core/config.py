@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     app_port: int = 7860
     log_level: str = "INFO"
 
+    # ── LLM Timeouts ──────────────────────────────────
+    llm_request_timeout: int = 120  # seconds; increase for slow networks
+
     # ── Security ───────────────────────────────────────
     # When set, all /api/* requests must include X-API-Key: <value>.
     # Leave empty in development to disable authentication.

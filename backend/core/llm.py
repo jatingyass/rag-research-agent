@@ -21,11 +21,6 @@ from .logging import get_logger
 logger = get_logger("llm")
 
 
-def _is_retryable(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(k in msg for k in ("503", "unavailable", "timeout", "connection"))
-
-
 @retry(
     retry=retry_if_exception_type(Exception),
     stop=stop_after_attempt(3),
@@ -37,6 +32,7 @@ def _build_llm(
     api_key: str,
     temperature: float,
     streaming: bool = False,
+    request_timeout: int = 120,
 ) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
         model=model,
@@ -44,6 +40,7 @@ def _build_llm(
         google_api_key=api_key,
         max_output_tokens=4096,
         streaming=streaming,
+        request_timeout=request_timeout,
     )
 
 
@@ -51,10 +48,21 @@ def _build_llm(
 def get_llm(temperature: float = 0.0) -> ChatGoogleGenerativeAI:
     """Standard LLM for chain calls. temperature=0 → deterministic RAG answers."""
     settings = get_settings()
-    return _build_llm(settings.gemini_model, settings.gemini_api_key, temperature)
+    return _build_llm(
+        settings.gemini_model,
+        settings.gemini_api_key,
+        temperature,
+        request_timeout=settings.llm_request_timeout,
+    )
 
 
 def get_streaming_llm() -> ChatGoogleGenerativeAI:
     """Streaming LLM — NOT cached (new instance per request for SSE)."""
     settings = get_settings()
-    return _build_llm(settings.gemini_model, settings.gemini_api_key, 0.0, streaming=True)
+    return _build_llm(
+        settings.gemini_model,
+        settings.gemini_api_key,
+        0.0,
+        streaming=True,
+        request_timeout=settings.llm_request_timeout,
+    )
