@@ -25,14 +25,21 @@ def _ensure_nltk_data() -> None:
 
 
 def _tokenize(text: str) -> list[str]:
+    """
+    Tokenize with word boundaries, stop word removal, and Porter stemming.
+    Stemming maps inflected forms to a common root (running→run) so BM25
+    can match across tenses and plurals without losing recall.
+    """
     _ensure_nltk_data()
     from nltk.tokenize import word_tokenize
     from nltk.corpus import stopwords as _sw
+    from nltk.stem import PorterStemmer
 
+    stemmer = PorterStemmer()
     stop_words = _sw.words("english")
     tokens = word_tokenize(text)
     return [
-        w.lower() for w in tokens
+        stemmer.stem(w.lower()) for w in tokens
         if w.isalpha() and w.lower() not in stop_words
     ]
 

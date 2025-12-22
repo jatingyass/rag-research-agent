@@ -60,19 +60,26 @@ class LocalCrossEncoderReranker:
         if not docs:
             return []
 
+        import math
+
         model = self._get_model()
         pairs = [(query, doc.page_content) for doc in docs]
         raw_scores = model.predict(pairs)
 
+        # Sigmoid-normalise ms-marco scores to [0, 1] for consistent
+        # display alongside Cohere scores (which are already in [0, 1]).
+        def _sigmoid(x: float) -> float:
+            return 1.0 / (1.0 + math.exp(-x))
+
         ranked = sorted(
-            zip(docs, raw_scores.tolist()),
+            zip(docs, [_sigmoid(float(s)) for s in raw_scores]),
             key=lambda x: x[1],
             reverse=True,
         )
 
         result = []
         for doc, score in ranked[:top_n]:
-            doc.metadata["relevance_score"] = round(float(score), 4)
+            doc.metadata["relevance_score"] = round(score, 4)
             doc.metadata["reranked"] = True
             doc.metadata["reranker"] = "local-cross-encoder"
             result.append(doc)
