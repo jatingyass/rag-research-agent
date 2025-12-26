@@ -88,6 +88,7 @@ class AgentState(TypedDict):
     answer: str
     citations: list               # list[Citation]
     route: str                    # "direct" | "retrieve"
+    context_sufficient: bool      # set by _node_check_sufficiency
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -141,6 +142,19 @@ _NO_DOCS_ANSWER = (
     "try rephrasing your question."
 )
 
+_SUFFICIENCY_PROMPT = ChatPromptTemplate.from_template(
+    """You are evaluating whether the retrieved context is sufficient to answer
+the user's question accurately.
+
+Question: {query}
+
+Retrieved context (first 1200 chars):
+{context_preview}
+
+Is the context sufficient to give a complete, accurate answer?
+Reply with exactly one word: yes  OR  no"""
+)
+
 
 # ── Node functions ────────────────────────────────────────────────────────────
 
@@ -187,6 +201,30 @@ def _node_retrieve(state: AgentState, hybrid: HybridRetriever, reranker, setting
         top_n=settings.top_k_final,
     )
     return {**state, "hybrid_results": hybrid_results, "reranked_docs": reranked_docs}
+
+
+def _node_check_sufficiency(state: AgentState, llm) -> AgentState:
+    """
+    Ask the LLM whether the retrieved context is adequate to answer the query.
+    If not sufficient, we still generate but with a caveat note.
+    """
+    docs = state.get("reranked_docs") or []
+    if not docs:
+        return {**state, "context_sufficient": False}
+
+    context_preview = _format_context(docs[:3])[:1200]
+    chain = _SUFFICIENCY_PROMPT | llm | StrOutputParser()
+    try:
+        raw = chain.invoke({
+            "query": state["contextualized_query"],
+            "context_preview": context_preview,
+        }).strip().lower()
+        sufficient = raw.startswith("yes")
+    except Exception:
+        sufficient = True  # assume sufficient on error to avoid blocking
+
+    logger.info(f"Context sufficiency: {sufficient}")
+    return {**state, "context_sufficient": sufficient}
 
 
 def _node_generate(state: AgentState, llm) -> AgentState:
@@ -249,6 +287,7 @@ class ResearchAgent:
         graph.add_node("contextualize", lambda s: _node_contextualize(s, llm, settings))
         graph.add_node("route_query", lambda s: _node_route_query(s, llm))
         graph.add_node("retrieve", lambda s: _node_retrieve(s, hybrid, reranker, settings))
+        graph.add_node("check_sufficiency", lambda s: _node_check_sufficiency(s, llm))
         graph.add_node("generate", lambda s: _node_generate(s, llm))
         graph.add_node("direct_answer", lambda s: _node_direct_answer(s, llm))
 
@@ -259,7 +298,9 @@ class ResearchAgent:
             lambda s: s["route"],
             {"retrieve": "retrieve", "direct": "direct_answer"},
         )
-        graph.add_edge("retrieve", "generate")
+        graph.add_edge("retrieve", "check_sufficiency")
+        # Always generate — but generate() uses context_sufficient flag for caveats
+        graph.add_edge("check_sufficiency", "generate")
         graph.add_edge("generate", END)
         graph.add_edge("direct_answer", END)
 
@@ -281,6 +322,7 @@ class ResearchAgent:
             "answer": "",
             "citations": [],
             "route": "retrieve",
+            "context_sufficient": True,
         }
         final = self._graph.invoke(initial)
         return ResearchResult(
